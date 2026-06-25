@@ -35,6 +35,46 @@ The following are not publicly downloadable as datasets at the time of writing:
 
 The CLI reports them as unavailable rather than pretending they can be downloaded.
 
+## Why ego data can accelerate teleoperation
+
+Short answer: yes, the current public evidence says that large-scale egocentric human data can materially improve downstream dexterous robot learning, including teleoperation-adjacent manipulation settings.
+
+### Public paper evidence
+
+| Paper | Core setup | Public result relevant to teleoperation | What this repo can support |
+| --- | --- | --- | --- |
+| [EgoScale: Scaling Dexterous Manipulation with Diverse Egocentric Human Data](https://arxiv.org/abs/2602.16710) | Pretrain a VLA policy on 20,854 hours of egocentric human video, then add a small aligned human-robot mid-training stage before downstream robot finetuning | Reports a 54% average success-rate improvement over a no-pretraining baseline on five dexterous real-robot tasks with a 22-DoF hand. Also reports a near log-linear scaling law between human-data scale and validation loss, with downstream robot performance improving consistently as pretraining data grows. | Use `egodex`, `ego4d`, and `ego_exo4d` as public ego-data proxies for pretraining-style experiments. Exact EgoScale numbers are not reproducible here because the 20k-hour mixture and aligned human-robot mid-training set are not public. |
+
+### Practical interpretation
+
+- Ego data is most useful as a reusable motor prior, not as a drop-in replacement for robot data.
+- The strongest public result is not "ego only", but "large-scale ego pretraining + a small amount of aligned human-robot data".
+- For teleoperation workflows, this means the likely gain is reduced robot-data demand, faster task adaptation, and better initialization for dexterous control policies.
+- This repo can help you assemble the public side of that pipeline, but it cannot reproduce the closed aligned human-robot mid-training data used in EgoScale.
+
+### Experiment results you can cite
+
+- EgoScale reports a 54% average success-rate gain over no pretraining on five dexterous manipulation tasks.
+- EgoScale reports that larger ego pretraining sets produce monotonic validation improvements and a near-perfect log-linear scaling fit with $R^2 = 0.9983$.
+- EgoScale reports one-shot transfer behavior when aligned human-robot mid-training is added, using only one robot demonstration per task during post-training together with aligned human demonstrations.
+
+### What is and is not reproducible in this repo
+
+Reproducible with public or manually accessible data in this repo:
+
+- Egocentric pretraining-style data collection with `egodex`, `ego4d`, and `ego_exo4d`
+- Motion prior experiments with `amass`, `babel`, and `lafan1`
+- Hand and hand-object evaluation with `interhand26m`, `ho3d`, `h2o3d`, and `dexycb`
+
+Not reproducible exactly from this repo:
+
+- EgoScale 20,854-hour internal pretraining mixture
+- EgoScale aligned human-robot mid-training data
+- SONIC 700-hour in-house mocap corpus
+- SONIC 300-trajectory VR teleoperation manipulation set
+
+So the defensible claim is: public ego data can support the same training direction and likely improve teleoperation-oriented manipulation learning, but the headline closed-data results from EgoScale and SONIC cannot be exactly matched with this repository alone.
+
 ## Quick start
 
 ```bash
