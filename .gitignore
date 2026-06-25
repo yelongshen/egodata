@@ -18,4 +18,22 @@ dist/
 
 # Local dataset outputs
 downloads/
+
+# Large generated outputs
+outputs/*.mp4
+outputs/*.png
+*.npz
+*.h5
+
+# Model checkpoints (tracked separately)
+checkpoints/
+
+# Paper PDFs and extracted text
+*.pdf
+*.txt
+
+# Temp files
+/tmp/
+dex5_urdf_tmp/
+
 logs/

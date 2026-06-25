@@ -4,6 +4,7 @@ import tarfile
 import zipfile
 from pathlib import Path
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 from .catalog import Dataset
 
@@ -88,14 +89,67 @@ def extract_local_dataset(
     return extracted_paths
 
 
-def download_url(url: str, destination: Path) -> None:
-    request = Request(url, headers={"User-Agent": "motion-dataset-downloaders/0.1"})
-    with urlopen(request) as response, destination.open("wb") as handle:
-        while True:
-            chunk = response.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            handle.write(chunk)
+def _remote_content_length(url: str) -> int | None:
+    """Return the Content-Length of a URL via HEAD, or None if unavailable."""
+    request = Request(url, headers={"User-Agent": "motion-dataset-downloaders/0.1"}, method="HEAD")
+    try:
+        with urlopen(request) as response:
+            length = response.headers.get("Content-Length")
+            return int(length) if length else None
+    except HTTPError:
+        return None
+
+
+def download_url(url: str, destination: Path, force: bool = False) -> None:
+    """Download url to destination, resuming partial files and retrying on transient errors."""
+    import time
+
+    remote_size = _remote_content_length(url)
+
+    max_attempts = 10
+    for attempt in range(1, max_attempts + 1):
+        local_size = destination.stat().st_size if destination.exists() else 0
+
+        # Already complete — skip.
+        if not force and remote_size is not None and local_size >= remote_size:
+            return
+
+        try:
+            if local_size > 0 and not force:
+                # Attempt a Range resume from where we left off.
+                headers = {
+                    "User-Agent": "motion-dataset-downloaders/0.1",
+                    "Range": f"bytes={local_size}-",
+                }
+                request = Request(url, headers=headers)
+                with urlopen(request) as response:
+                    if response.status == 206:
+                        with destination.open("ab") as handle:
+                            while True:
+                                chunk = response.read(CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                handle.write(chunk)
+                        return
+                    # Server ignored Range (200) — fall through to full download.
+
+            # Full download (new file, force, or server doesn't support Range).
+            request = Request(url, headers={"User-Agent": "motion-dataset-downloaders/0.1"})
+            with urlopen(request) as response, destination.open("wb") as handle:
+                while True:
+                    chunk = response.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+            return
+
+        except (OSError, ConnectionError) as exc:
+            if attempt == max_attempts:
+                raise
+            wait = min(30 * attempt, 300)  # 30s, 60s, 90s … capped at 5 min
+            print(f"[attempt {attempt}/{max_attempts}] {exc!r} — retrying in {wait}s …",
+                  flush=True)
+            time.sleep(wait)
 
 
 def download_dataset(
@@ -117,10 +171,7 @@ def download_dataset(
         if asset_names is not None and asset.name not in asset_names:
             continue
         destination = dataset_dir / asset.filename
-        if destination.exists() and not force:
-            written_paths.append(destination)
-            continue
-        download_url(asset.url, destination)
+        download_url(asset.url, destination, force=force)
         written_paths.append(destination)
 
     return written_paths
