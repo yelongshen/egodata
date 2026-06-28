@@ -25,6 +25,10 @@ outputs/*.png
 *.npz
 *.h5
 
+# Allow sample data in samples/
+!samples/**/*.hdf5
+!samples/**/*.mp4
+
 # Model checkpoints (tracked separately)
 checkpoints/
 
