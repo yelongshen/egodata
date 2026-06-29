@@ -1,10 +1,11 @@
 """
 visualize_retargeted_dex3.py
 -----------------------------
-Visualize EgoDex AVP hand data retargeted to Unitree Dex3-1 (7 DoF)
-using the dex-retargeting library (same library as unitreerobotics/xr_teleoperate).
+Visualize EgoDex AVP hand data retargeted to Unitree Dex3-1 (7 DoF).
+Uses angle-based geometric retargeting (egodex_retarget_dex3.py)
+and yourdfpy FK for accurate 3-D link positions.
 
-Layout:  [ Human (AVP) | dex-retargeting (vector) ]
+Layout:  [ Human (AVP) | Dex3-1 robot hand ]
 
 Usage:
   python scripts/visualize_retargeted_dex3.py --all_samples
@@ -15,7 +16,6 @@ from __future__ import annotations
 import argparse, math, sys, time
 from pathlib import Path
 import h5py, numpy as np
-import yaml
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -24,55 +24,28 @@ import matplotlib.gridspec as gridspec
 from mpl_toolkits.mplot3d import Axes3D  # noqa
 
 REPO_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-# ─── dex-retargeting setup ────────────────────────────────────────────────────
-from dex_retargeting.retargeting_config import RetargetingConfig
-from dex_retargeting.seq_retarget import SeqRetargeting
+from scripts.egodex_retarget_dex3 import retarget_dex3, JOINT_NAMES, N_JOINTS, _LO, _HI
+import yourdfpy as _ydfpy
 
 URDF_PATH = REPO_ROOT / "assets/dex3_1/dex3_1_r.urdf"
-CFG_PATH  = REPO_ROOT / "assets/dex3_1/dex3_1_right_teleop.yml"
 
-def build_retargeter() -> SeqRetargeting:
-    """Load Dex3-1 config and build a SeqRetargeting solver."""
-    with open(CFG_PATH) as f:
-        cfg = yaml.safe_load(f)["retargeting"]
-    cfg["urdf_path"] = str(URDF_PATH)   # inject absolute path
-    config = RetargetingConfig.from_dict(cfg)
-    return config.build()
-
-# EgoDex (25 joints) → MediaPipe 21-point convention
-# MediaPipe: 0=wrist, 1-4=thumb, 5-8=index, 9-12=middle, 13-16=ring, 17-20=pinky
-# EgoDex layout: 0=wrist, 1-4=thumb, 5-9=index(meta+4), 10-14=middle(meta+4),
-#                15-19=ring(meta+4), 20-24=little(meta+4)
-EGODEX_TO_MP21 = [
-    0,              # MP 0  wrist
-    1, 2, 3, 4,     # MP 1-4  thumb knuckle→tip
-    6, 7, 8, 9,     # MP 5-8  index knuckle→tip  (skip metacarpal=5)
-    11, 12, 13, 14, # MP 9-12 middle knuckle→tip (skip metacarpal=10)
-    16, 17, 18, 19, # MP 13-16 ring knuckle→tip  (skip metacarpal=15)
-    21, 22, 23, 24, # MP 17-20 little knuckle→tip(skip metacarpal=20)
-]  # len=21
-
-# ─── Colours / constants ──────────────────────────────────────────────────────
+# ─── Colours ─────────────────────────────────────────────────────────────────
 BG   = "#0d1117"
-FCOL = {"thumb":"#FF6B6B","index":"#4ECDC4","middle":"#FFD93D","ring":"#aaa","little":"#aaa"}
-DR_COLOR = "#a29bfe"   # lavender for dex-retargeting result
+FCOL = {"thumb":"#FF6B6B","index":"#4ECDC4","middle":"#FFD93D"}
+ROB_COL = "#a29bfe"
 
-# Dex3-1 link names (returned by yourdfpy)
-import yourdfpy as _ydfpy
-_robot_cache = None
-def _robot():
-    global _robot_cache
-    if _robot_cache is None:
-        _robot_cache = _ydfpy.URDF.load(str(URDF_PATH))
-    return _robot_cache
-
+# ─── Dex3-1 yourdfpy FK ───────────────────────────────────────────────────────
 JOINT_NAMES_URDF = [
     "right_hand_thumb_0_joint","right_hand_thumb_1_joint","right_hand_thumb_2_joint",
     "right_hand_index_0_joint","right_hand_index_1_joint",
     "right_hand_middle_0_joint","right_hand_middle_1_joint",
 ]
-JOINT_NAMES_DISP = ["thumb_abd","thumb_mcp","thumb_ip","idx_mcp","idx_pip","mid_mcp","mid_pip"]
+# retarget_dex3 order: thumb_0,thumb_1,thumb_2, index_0,index_1, middle_0,middle_1
+# yourdfpy actuated:   thumb_0,thumb_1,thumb_2, middle_0,middle_1, index_0,index_1
+REORDER_TO_URDF = [0, 1, 2, 5, 6, 3, 4]
+
 LINKS = [
     "right_hand_palm_link",
     "right_hand_thumb_0_link","right_hand_thumb_1_link","right_hand_thumb_2_link",
@@ -85,16 +58,29 @@ def _bcol(p,c):
     if p<=5 or c<=5: return FCOL["index"]
     return FCOL["middle"]
 
-# joint limits (deg) for bar chart — order matches rt.joint_names:
-# [index_0, index_1, middle_0, middle_1, thumb_0, thumb_1, thumb_2]
-_LO_DEG = np.array([  0,   0,   0,   0, -60, -60, -100], np.float32)
-_HI_DEG = np.array([ 90, 100,  90, 100,  60,  35,    0], np.float32)
-JOINT_NAMES_DISP = ["idx_mcp","idx_pip","mid_mcp","mid_pip","thumb_abd","thumb_mcp","thumb_ip"]
+_robot_obj = None
+def _robot():
+    global _robot_obj
+    if _robot_obj is None:
+        _robot_obj = _ydfpy.URDF.load(str(URDF_PATH))
+    return _robot_obj
 
-# Dex3-1 view limits (metres)
-DEX3 = dict(x=(-0.02,0.15),y=(-0.10,0.12),z=(-0.06,0.06))
+def fk(q7: np.ndarray) -> np.ndarray:
+    """(7,) in retarget order → (8,3) link positions."""
+    rob = _robot()
+    q_urdf = q7[REORDER_TO_URDF]
+    rob.update_cfg({n: float(v) for n,v in zip(rob.actuated_joint_names, q_urdf)})
+    return np.array([rob.get_transform(l)[:3,3] for l in LINKS], dtype=np.float32)
 
-# ─── EgoDex joint list ────────────────────────────────────────────────────────
+def fk_batch(q_seq: np.ndarray) -> np.ndarray:
+    return np.stack([fk(q_seq[t]) for t in range(len(q_seq))])
+
+# joint limits for bar chart — retarget_dex3 order
+_LO_DEG = np.degrees(_LO)
+_HI_DEG = np.degrees(_HI)
+DEX3_LIM = dict(x=(-0.02,0.15),y=(-0.12,0.12),z=(-0.06,0.06))
+
+# ─── EgoDex joints ───────────────────────────────────────────────────────────
 RIGHT_JOINTS = [
     "rightHand","rightThumbKnuckle","rightThumbIntermediateBase",
     "rightThumbIntermediateTip","rightThumbTip","rightIndexFingerMetacarpal",
@@ -116,45 +102,14 @@ def _hcol(a,b):
     if a<=14 or b<=14: return FCOL["middle"]
     return "#555"
 
-# ─── Data loading ─────────────────────────────────────────────────────────────
 def load_ep(path):
     with h5py.File(path) as f:
         kp = np.stack([f[f"transforms/{j}"][:] for j in RIGHT_JOINTS], axis=1)
         conf = f["confidences/rightHand"][:] if "confidences/rightHand" in f else np.ones(kp.shape[0])
         desc = str(f.attrs.get("llm_description") or f.attrs.get("description",""))
         task = str(f.attrs.get("task", path.parent.name)); ep = int(path.stem)
-    kp_local = kp[:,:,:3,3] - kp[:,0:1,:3,3]   # wrist-relative (T,25,3)
+    kp_local = kp[:,:,:3,3] - kp[:,0:1,:3,3]
     return dict(kp=kp, kp_local=kp_local, conf=conf, desc=desc, task=task, ep=ep, T=kp.shape[0])
-
-# ─── Retargeting via dex-retargeting ─────────────────────────────────────────
-def retarget_sequence(kp_local: np.ndarray, retargeter: SeqRetargeting) -> np.ndarray:
-    """(T,25,3) wrist-local → (T,7) Dex3-1 joint angles via dex-retargeting."""
-    T = kp_local.shape[0]
-    # dex-retargeting expects (N_pts, 3) with wrist first, then fingertips
-    # We provide: wrist(0) + thumb_tip(4) + idx_tip(9) + mid_tip(14) + ring_tip(19) + little_tip(24)
-    q_seq = np.zeros((T,7), np.float32)
-    retargeter.reset()
-    for t in range(T):
-        mp21 = kp_local[t, EGODEX_TO_MP21]  # (21,3) MediaPipe format
-        # dex-retargeting position optimizer expects ONLY the target positions
-        # in the same order as target_link_names: [thumb_tip, index_tip, middle_tip]
-        # MediaPipe indices: 4=thumb_tip, 8=index_tip, 12=middle_tip
-        pts = mp21[[4, 8, 12]]   # (3,3) — exactly what the optimizer expects
-        q = retargeter.retarget(pts)
-        q_seq[t] = q[-7:]  # last 7 = actual joints (skip 6 dummy free-joint DoF)
-    return q_seq
-
-# ─── FK via yourdfpy ──────────────────────────────────────────────────────────
-def fk(q7: np.ndarray, joint_names: list) -> np.ndarray:
-    """(7,) joint angles + joint_names (may include dummy names) → (8,3) link positions."""
-    robot = _robot()
-    # Skip dummy free-joint names — yourdfpy only knows the real URDF joints
-    real_pairs = [(n, v) for n, v in zip(joint_names, q7) if "dummy" not in n]
-    robot.update_cfg({n: float(v) for n, v in real_pairs})
-    return np.array([robot.get_transform(l)[:3, 3] for l in LINKS], dtype=np.float32)
-
-def fk_batch(q_seq: np.ndarray, joint_names: list) -> np.ndarray:
-    return np.stack([fk(q_seq[t], joint_names) for t in range(len(q_seq))])
 
 # ─── Drawing ─────────────────────────────────────────────────────────────────
 def _sax(ax, robot=False):
@@ -167,8 +122,8 @@ def _sax(ax, robot=False):
         l.set_color("#666"); l.set_fontsize(6)
     if robot:
         ax.view_init(elev=20, azim=160)
-        ax.set_xlabel("X ext→"); ax.set_ylabel("Y curl↑"); ax.set_zlabel("Z lat")
-        ax.set_xlim(*DEX3["x"]); ax.set_ylim(*DEX3["y"]); ax.set_zlim(*DEX3["z"])
+        ax.set_xlabel("X (ext→)"); ax.set_ylabel("Y (curl↑)"); ax.set_zlabel("Z (lat)")
+        ax.set_xlim(*DEX3_LIM["x"]); ax.set_ylim(*DEX3_LIM["y"]); ax.set_zlim(*DEX3_LIM["z"])
 
 def _eq(ax, pts):
     c=(pts.max(0)+pts.min(0))/2; h=(pts.max(0)-pts.min(0)).max()/2*0.7
@@ -180,31 +135,31 @@ def draw_human(ax, kp, alpha=0.9):
     ax.scatter(*kp[0],s=30,c="white",edgecolors="#888",lw=0.8,zorder=5)
     for i in [4,9,14,19,24]: ax.scatter(*kp[i],s=14,c="white",zorder=5,alpha=alpha)
 
-def draw_dex3(ax, pts, color=DR_COLOR, alpha=0.92):
+def draw_dex3(ax, pts, color=ROB_COL, alpha=0.92):
     for a,b in BONES:
-        lw = 2.5 if (a,b)!=(4,6) else 0.8
+        lw = 2.5 if (a,b)!=(4,6) else 0.7
         al = alpha if (a,b)!=(4,6) else 0.2
         ax.plot(*zip(pts[a],pts[b]),color=color,lw=lw,alpha=al)
-    ax.scatter(pts[:,0],pts[:,1],pts[:,2],s=22,c=color,edgecolors="white",lw=0.4,zorder=4,alpha=alpha)
+    ax.scatter(pts[:,0],pts[:,1],pts[:,2],s=22,c=color,
+               edgecolors="white",lw=0.4,zorder=4,alpha=alpha)
     ax.scatter(*pts[0],s=55,c="white",edgecolors="#555",lw=1,zorder=6)
-    for i,lbl in {0:"palm",3:"thumb",5:"index",7:"middle"}.items():
+    for i,lbl in {0:"palm",3:"thumb",5:"idx",7:"mid"}.items():
         ax.text(*pts[i],f" {lbl}",color="#aaa",fontsize=5)
 
-def _jbar(ax, q_deg, color=DR_COLOR):
+def _jbar(ax, q_deg, color=ROB_COL):
     ax.set_facecolor(BG)
-    r = _HI_DEG - _LO_DEG
-    pct = (q_deg - _LO_DEG) / np.where(r>1e-4, r, 1.)
-    cols = [FCOL["thumb"]]*3 + [FCOL["index"]]*2 + [FCOL["middle"]]*2
-    ax.barh(range(7), pct, color=cols, edgecolor="none", height=0.65, alpha=0.85)
-    ax.barh(range(7), [1]*7, color="none", edgecolor="#444", height=0.65, lw=0.5)
+    r=_HI_DEG-_LO_DEG; pct=(q_deg-_LO_DEG)/np.where(r>1e-4,r,1.)
+    cols=[FCOL["thumb"]]*3+[FCOL["index"]]*2+[FCOL["middle"]]*2
+    ax.barh(range(7),pct,color=cols,edgecolor="none",height=0.65,alpha=0.85)
+    ax.barh(range(7),[1]*7,color="none",edgecolor="#444",height=0.65,lw=0.5)
     ax.set_yticks(range(7))
-    ax.set_yticklabels([f"{n} {v:+.0f}°" for n,v in zip(JOINT_NAMES_DISP,q_deg)],
-                        fontsize=5.5, color="white")
+    ax.set_yticklabels([f"{n} {v:+.0f}°" for n,v in zip(JOINT_NAMES,q_deg)],
+                        fontsize=5.5,color="white")
     ax.set_xlim(0,1.1); ax.set_xticks([0,1])
     ax.set_xticklabels(["lo","hi"],fontsize=5,color="white")
     for s in ax.spines.values(): s.set_edgecolor("#333")
 
-# ─── Static plot ──────────────────────────────────────────────────────────────
+# ─── Static plot ─────────────────────────────────────────────────────────────
 def plot_static(ep, q_seq, fk_seq, frame, out_path):
     kp  = ep["kp_local"][frame]
     all_kp = ep["kp_local"].reshape(-1,3)
@@ -214,32 +169,29 @@ def plot_static(ep, q_seq, fk_seq, frame, out_path):
     gs  = gridspec.GridSpec(2,2,figure=fig,hspace=0.3,wspace=0.1,
                             height_ratios=[2.5,1],width_ratios=[1,1])
 
-    # Human skeleton
     ax_h = fig.add_subplot(gs[0,0],projection="3d")
     _sax(ax_h); _eq(ax_h, all_kp)
     draw_human(ax_h, kp)
     ax_h.set_title("Human hand (Apple Vision Pro)", color="white", fontsize=9, pad=5)
 
-    # Dex3-1 skeleton
     ax_r = fig.add_subplot(gs[0,1],projection="3d")
     _sax(ax_r, robot=True)
     draw_dex3(ax_r, fk_seq[frame])
-    ax_r.set_title("Dex3-1 retargeted (dex-retargeting · vector)", color=DR_COLOR, fontsize=9, pad=5)
+    ax_r.set_title("Dex3-1 retargeted (angle-based geometric)", color=ROB_COL, fontsize=9, pad=5)
 
-    # Joint bar (human)
-    ax_blank = fig.add_subplot(gs[1,0]); ax_blank.axis("off")
-    ax_blank.text(0.5,0.5,
-        f"Task: {ep['task']}\nEp {ep['ep']}  Frame {frame}/{ep['T']-1}\n{ep['desc'][:60]}",
+    ax_info = fig.add_subplot(gs[1,0]); ax_info.axis("off")
+    ax_info.text(0.5, 0.5,
+        f"Task: {ep['task']}\nEpisode {ep['ep']}  Frame {frame}/{ep['T']-1}\n{ep['desc'][:65]}",
         color="white", fontsize=8, ha="center", va="center",
-        transform=ax_blank.transAxes, wrap=True)
+        transform=ax_info.transAxes, wrap=True)
 
-    # Joint bar (robot)
     ax_j = fig.add_subplot(gs[1,1])
     _jbar(ax_j, q_deg)
-    ax_j.set_title("Dex3-1 joint angles",color=DR_COLOR,fontsize=8,pad=3)
+    ax_j.set_title("Dex3-1 joint angles (7 DoF)",color=ROB_COL,fontsize=8,pad=3)
 
     fig.suptitle(
-        f"EgoDex → Dex3-1  [{ep['task']}  ep{ep['ep']}  fr{frame}/{ep['T']-1}]  {ep['desc'][:70]}",
+        f"EgoDex → Dex3-1  [{ep['task']}  ep{ep['ep']}  fr{frame}/{ep['T']-1}]  "
+        f"{ep['desc'][:70]}",
         color="white",fontsize=9,y=1.005)
     fig.savefig(str(out_path),dpi=150,bbox_inches="tight",facecolor=BG)
     plt.close(fig)
@@ -265,12 +217,10 @@ def make_animation(ep, q_seq, fk_seq, out_path, fps=30, stride=1):
 
         ax_r.cla(); _sax(ax_r,robot=True)
         draw_dex3(ax_r,fk_seq[t])
-        ax_r.set_title("Dex3-1 (dex-retargeting)",color=DR_COLOR,fontsize=8,pad=4)
+        ax_r.set_title("Dex3-1 (geometric retarget)",color=ROB_COL,fontsize=8,pad=4)
 
-        ax_j.cla()
-        _jbar(ax_j, np.degrees(q_seq[t]))
-        ax_j.set_title("Joint angles",color=DR_COLOR,fontsize=7,pad=2)
-
+        ax_j.cla(); _jbar(ax_j,np.degrees(q_seq[t]))
+        ax_j.set_title("Joint angles",color=ROB_COL,fontsize=7,pad=2)
         title_obj.set_text(
             f"[{ep['task']}  ep{ep['ep']}]  fr{t}/{T-1}  {ep['desc'][:55]}")
         return []
@@ -283,34 +233,38 @@ def make_animation(ep, q_seq, fk_seq, out_path, fps=30, stride=1):
     plt.close(fig)
     print(f"  → {out_path}")
 
-# ─── Run one episode ──────────────────────────────────────────────────────────
-def run_one(hdf5_path, out_dir, retargeter, args):
-    ep=load_ep(hdf5_path)
-    task=ep["task"].replace(" ","_").replace("/","_"); epn=ep["ep"]
+# ─── Run one episode ─────────────────────────────────────────────────────────
+def run_one(hdf5_path, out_dir, args):
+    ep = load_ep(hdf5_path)
+    task = ep["task"].replace(" ","_").replace("/","_"); epn = ep["ep"]
     print(f"\n{'─'*55}\n{ep['task']}  T={ep['T']}  conf={ep['conf'].mean():.3f}")
     print(f"  {ep['desc'][:70]}")
 
-    t0=time.perf_counter()
-    q_seq=retarget_sequence(ep["kp_local"], retargeter)
-    rt=(time.perf_counter()-t0)*1000
-    print(f"  Retargeting (dex-retargeting vector): {rt:.1f}ms")
+    t0 = time.perf_counter()
+    q_seq = retarget_dex3(ep["kp"], algo="angle", smoothing=0.3)
+    print(f"  Retargeting (angle-based): {(time.perf_counter()-t0)*1000:.1f}ms")
     print(f"  q range: [{np.degrees(q_seq.min()):+.1f}°, {np.degrees(q_seq.max()):+.1f}°]")
+    # Confirm motion
+    q_var = np.degrees(q_seq.std(axis=0))
+    movers = [(JOINT_NAMES[j], q_var[j]) for j in range(N_JOINTS) if q_var[j] > 1.0]
+    print(f"  Moving joints (std > 1°): {[(n, f'{v:.1f}°') for n,v in movers]}")
 
-    t0=time.perf_counter()
-    fk_seq=fk_batch(q_seq, retargeter.joint_names)
+    t0 = time.perf_counter()
+    fk_seq = fk_batch(q_seq)
     print(f"  FK (yourdfpy): {(time.perf_counter()-t0)*1000:.1f}ms")
 
+    out_dir.mkdir(parents=True, exist_ok=True)
     fr = args.frame if args.frame is not None else ep["T"]//2
-    plot_static(ep,q_seq,fk_seq,fr,
+    plot_static(ep, q_seq, fk_seq, fr,
                 out_dir/f"{task}_ep{epn}_dexretarget_frame{fr}.png")
     if not args.static:
-        make_animation(ep,q_seq,fk_seq,
+        make_animation(ep, q_seq, fk_seq,
                        out_dir/f"{task}_ep{epn}_dexretarget.mp4",
-                       fps=args.fps,stride=args.stride)
+                       fps=args.fps, stride=args.stride)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    p=argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
     p.add_argument("--hdf5",        type=Path, default=None)
     p.add_argument("--out_dir",     type=Path, default=Path("outputs"))
     p.add_argument("--static",      action="store_true")
@@ -318,21 +272,19 @@ def main():
     p.add_argument("--fps",         type=int,  default=30)
     p.add_argument("--stride",      type=int,  default=1)
     p.add_argument("--all_samples", action="store_true")
-    args=p.parse_args()
+    args = p.parse_args()
 
     if args.all_samples:
-        files=sorted((REPO_ROOT/"samples/egodex").rglob("*.hdf5"))
+        files = sorted((REPO_ROOT/"samples/egodex").rglob("*.hdf5"))
     elif args.hdf5:
-        files=[args.hdf5]
+        files = [args.hdf5]
     else:
-        files=[REPO_ROOT/"samples/egodex/lock_unlock_key/9.hdf5"]
+        files = [REPO_ROOT/"samples/egodex/lock_unlock_key/9.hdf5"]
 
-    print("Building dex-retargeting solver (Dex3-1) …")
-    retargeter=build_retargeter()
     print(f"Processing {len(files)} episodes → {args.out_dir}/")
     for f in files:
-        run_one(f, args.out_dir, retargeter, args)
+        run_one(f, args.out_dir, args)
     print("\nDone.")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
