@@ -40,10 +40,18 @@ def build_retargeter() -> SeqRetargeting:
     config = RetargetingConfig.from_dict(cfg)
     return config.build()
 
-# EgoDex → dex-retargeting keypoint layout
-# dex-retargeting expects wrist + 5 fingertips (21-point MediaPipe convention)
-# EgoDex: 0=wrist, 4=thumb_tip, 9=index_tip, 14=middle_tip, 19=ring_tip, 24=little_tip
-EGODEX_TO_DR = [0, 4, 9, 14, 19, 24]  # 6 keypoints: wrist + 5 tips
+# EgoDex (25 joints) → MediaPipe 21-point convention
+# MediaPipe: 0=wrist, 1-4=thumb, 5-8=index, 9-12=middle, 13-16=ring, 17-20=pinky
+# EgoDex layout: 0=wrist, 1-4=thumb, 5-9=index(meta+4), 10-14=middle(meta+4),
+#                15-19=ring(meta+4), 20-24=little(meta+4)
+EGODEX_TO_MP21 = [
+    0,              # MP 0  wrist
+    1, 2, 3, 4,     # MP 1-4  thumb knuckle→tip
+    6, 7, 8, 9,     # MP 5-8  index knuckle→tip  (skip metacarpal=5)
+    11, 12, 13, 14, # MP 9-12 middle knuckle→tip (skip metacarpal=10)
+    16, 17, 18, 19, # MP 13-16 ring knuckle→tip  (skip metacarpal=15)
+    21, 22, 23, 24, # MP 17-20 little knuckle→tip(skip metacarpal=20)
+]  # len=21
 
 # ─── Colours / constants ──────────────────────────────────────────────────────
 BG   = "#0d1117"
@@ -127,16 +135,22 @@ def retarget_sequence(kp_local: np.ndarray, retargeter: SeqRetargeting) -> np.nd
     q_seq = np.zeros((T,7), np.float32)
     retargeter.reset()
     for t in range(T):
-        pts = kp_local[t, EGODEX_TO_DR]   # (6,3): wrist + 5 fingertips
-        q = retargeter.retarget(pts)       # returns (n_joints,) in the order target_joint_names
-        q_seq[t] = q
+        mp21 = kp_local[t, EGODEX_TO_MP21]  # (21,3) MediaPipe format
+        # dex-retargeting position optimizer expects ONLY the target positions
+        # in the same order as target_link_names: [thumb_tip, index_tip, middle_tip]
+        # MediaPipe indices: 4=thumb_tip, 8=index_tip, 12=middle_tip
+        pts = mp21[[4, 8, 12]]   # (3,3) — exactly what the optimizer expects
+        q = retargeter.retarget(pts)
+        q_seq[t] = q[-7:]  # last 7 = actual joints (skip 6 dummy free-joint DoF)
     return q_seq
 
 # ─── FK via yourdfpy ──────────────────────────────────────────────────────────
 def fk(q7: np.ndarray, joint_names: list) -> np.ndarray:
-    """(7,) joint angles + joint_names list → (8,3) link positions."""
+    """(7,) joint angles + joint_names (may include dummy names) → (8,3) link positions."""
     robot = _robot()
-    robot.update_cfg({n: float(v) for n, v in zip(joint_names, q7)})
+    # Skip dummy free-joint names — yourdfpy only knows the real URDF joints
+    real_pairs = [(n, v) for n, v in zip(joint_names, q7) if "dummy" not in n]
+    robot.update_cfg({n: float(v) for n, v in real_pairs})
     return np.array([robot.get_transform(l)[:3, 3] for l in LINKS], dtype=np.float32)
 
 def fk_batch(q_seq: np.ndarray, joint_names: list) -> np.ndarray:

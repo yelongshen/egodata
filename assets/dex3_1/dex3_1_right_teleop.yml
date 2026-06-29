@@ -1,53 +1,27 @@
-# Dex3-1 right hand retargeting config for dex-retargeting library
-# Unitree Dex3-1: 7 DoF, 3 fingers (thumb + index + middle)
-#
-# Human hand keypoint indices (EgoDex / MediaPipe-compatible):
-#   0 = wrist
-#   4 = thumb tip
-#   8 = index tip   (we use 9 = rightIndexFingerTip)
-#  12 = middle tip  (we use 14 = rightMiddleFingerTip)
-#
-# target_link_human_indices format: [[wrist_per_finger], [tip_per_finger]]
+# Dex3-1 right hand position-based retargeting
+# type: position minimizes ||FK(q)[fingertip] - human_pts[i]||^2
 
 retargeting:
-  type: vector
+  type: position
   urdf_path: PLACEHOLDER   # replaced at runtime with absolute path
 
-  # Joints the optimizer controls (all 7 active DoF)
   target_joint_names:
-    - right_hand_thumb_0_joint    # abduction  [-60°, +60°]
-    - right_hand_thumb_1_joint    # MCP        [-60°, +35°]
-    - right_hand_thumb_2_joint    # IP         [-100°, 0°]
-    - right_hand_index_0_joint    # MCP        [0°, 90°]
-    - right_hand_index_1_joint    # PIP        [0°, 100°]
-    - right_hand_middle_0_joint   # MCP        [0°, 90°]
-    - right_hand_middle_1_joint   # PIP        [0°, 100°]
+    - right_hand_thumb_0_joint
+    - right_hand_thumb_1_joint
+    - right_hand_thumb_2_joint
+    - right_hand_index_0_joint
+    - right_hand_index_1_joint
+    - right_hand_middle_0_joint
+    - right_hand_middle_1_joint
 
-  # Palm link as the origin for each finger's target vector
-  target_origin_link_names:
-    - right_hand_palm_link   # thumb origin
-    - right_hand_palm_link   # index origin
-    - right_hand_palm_link   # middle origin
+  target_link_names:
+    - right_hand_thumb_2_link
+    - right_hand_index_1_link
+    - right_hand_middle_1_link
 
-  # Fingertip links to match (the optimizer moves these toward human tips)
-  target_task_link_names:
-    - right_hand_thumb_2_link    # thumb tip
-    - right_hand_index_1_link    # index tip
-    - right_hand_middle_1_link   # middle tip
+  # MediaPipe 21-pt indices: 4=thumb_tip, 8=index_tip, 12=middle_tip
+  target_link_human_indices: [4, 8, 12]
 
-  # Scale human hand (≈20cm span) to Dex3-1 (≈12cm span)
-  scaling_factor: 0.55
-
-  # EgoDex keypoint indices IN THE 6-POINT INPUT we pass:
-  #   pts[0] = wrist
-  #   pts[1] = thumb tip
-  #   pts[2] = index tip
-  #   pts[3] = middle tip
-  #   pts[4] = ring tip   (unused — no ring finger on Dex3-1)
-  #   pts[5] = little tip (unused)
-  # Format: [[wrist_index_per_finger], [tip_index_per_finger]]
-  target_link_human_indices:
-    - [0, 0, 0]
-    - [1, 2, 3]
-
-  low_pass_alpha: 0.3
+  add_dummy_free_joint: True
+  low_pass_alpha: 0.4
+  ignore_mimic_joint: False
