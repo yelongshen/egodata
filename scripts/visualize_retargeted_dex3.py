@@ -1,11 +1,16 @@
 """
 visualize_retargeted_dex3.py
 -----------------------------
-Visualize EgoDex AVP hand data retargeted to Unitree Dex3-1 (7 DoF).
-Uses angle-based geometric retargeting (egodex_retarget_dex3.py)
-and yourdfpy FK for accurate 3-D link positions.
+Visualize EgoDex AVP hand data retargeted to Unitree Dex3-1 (7 DoF)
+using the OFFICIAL DexPilot algorithm from unitreerobotics/xr_teleoperate.
 
-Layout:  [ Human (AVP) | Dex3-1 robot hand ]
+Pipeline (matches xr_teleoperate exactly):
+  EgoDex keypoints (25-joint SE3)
+    → MediaPipe 21-pt wrist-local positions
+    → ref_value = hand_data[indices[1,:]] - hand_data[indices[0,:]]  (6 vectors)
+    → DexPilot retargeting (dex-retargeting library)
+    → q_hardware[right_dex_retargeting_to_hardware]
+    → yourdfpy FK → 3-D link positions
 
 Usage:
   python scripts/visualize_retargeted_dex3.py --all_samples
@@ -15,7 +20,7 @@ Usage:
 from __future__ import annotations
 import argparse, math, sys, time
 from pathlib import Path
-import h5py, numpy as np
+import h5py, numpy as np, yaml
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -26,38 +31,47 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.egodex_retarget_dex3 import retarget_dex3, JOINT_NAMES, N_JOINTS, _LO, _HI
-import yourdfpy as _ydfpy
+# ─── Official DexPilot retargeting setup ─────────────────────────────────────
+from dex_retargeting.retargeting_config import RetargetingConfig
 
-URDF_PATH = REPO_ROOT / "assets/dex3_1/dex3_1_r.urdf"
+ASSETS_DIR    = REPO_ROOT / "assets"
+DEX3_CFG_PATH = ASSETS_DIR / "unitree_hand/unitree_dex3.yml"
+URDF_PATH     = ASSETS_DIR / "unitree_hand/unitree_dex3_right.urdf"
 
-# ─── Colours ─────────────────────────────────────────────────────────────────
-BG   = "#0d1117"
-FCOL = {"thumb":"#FF6B6B","index":"#4ECDC4","middle":"#FFD93D"}
-ROB_COL = "#a29bfe"
-
-# ─── Dex3-1 yourdfpy FK ───────────────────────────────────────────────────────
-JOINT_NAMES_URDF = [
+# Hardware joint order from Unitree SDK docs (right hand):
+# thumb_0, thumb_1, thumb_2, middle_0, middle_1, index_0, index_1
+DEX3_HW_JOINTS = [
     "right_hand_thumb_0_joint","right_hand_thumb_1_joint","right_hand_thumb_2_joint",
-    "right_hand_index_0_joint","right_hand_index_1_joint",
     "right_hand_middle_0_joint","right_hand_middle_1_joint",
+    "right_hand_index_0_joint","right_hand_index_1_joint",
 ]
-# retarget_dex3 order: thumb_0,thumb_1,thumb_2, index_0,index_1, middle_0,middle_1
-# yourdfpy actuated:   thumb_0,thumb_1,thumb_2, middle_0,middle_1, index_0,index_1
-REORDER_TO_URDF = [0, 1, 2, 5, 6, 3, 4]
 
-LINKS = [
-    "right_hand_palm_link",
-    "right_hand_thumb_0_link","right_hand_thumb_1_link","right_hand_thumb_2_link",
-    "right_hand_index_0_link","right_hand_index_1_link",
-    "right_hand_middle_0_link","right_hand_middle_1_link",
-]
-BONES = [(0,1),(1,2),(2,3),(0,4),(4,5),(0,6),(6,7),(4,6)]
-def _bcol(p,c):
-    if p<=3 or c<=3: return FCOL["thumb"]
-    if p<=5 or c<=5: return FCOL["index"]
-    return FCOL["middle"]
+def build_retargeter():
+    RetargetingConfig.set_default_urdf_dir(str(ASSETS_DIR))
+    with open(DEX3_CFG_PATH) as f:
+        cfg = yaml.safe_load(f)["right"]
+    rt = RetargetingConfig.from_dict(cfg).build()
+    indices = rt.optimizer.target_link_human_indices          # (2,6)
+    hw_order = [rt.joint_names.index(n) for n in DEX3_HW_JOINTS]
+    return rt, indices, hw_order
 
+# EgoDex (25-joint) → MediaPipe 21-pt convention
+EGODEX_TO_MP21 = [0,1,2,3,4,6,7,8,9,11,12,13,14,16,17,18,19,21,22,23,24]
+
+def retarget_sequence(kp_local, rt, indices, hw_order):
+    """(T,25,3) → (T,7) in hardware joint order using official DexPilot method."""
+    T = kp_local.shape[0]
+    q_seq = np.zeros((T, 7), np.float32)
+    rt.reset()
+    for t in range(T):
+        mp21 = kp_local[t, EGODEX_TO_MP21]                   # (21,3)
+        ref  = mp21[indices[1,:]] - mp21[indices[0,:]]         # (6,3) vectors
+        q    = rt.retarget(ref)                                # all joints
+        q_seq[t] = q[hw_order]                                 # reorder to HW order
+    return q_seq
+
+# ─── FK via yourdfpy (official URDF) ─────────────────────────────────────────
+import yourdfpy as _ydfpy
 _robot_obj = None
 def _robot():
     global _robot_obj
@@ -65,20 +79,35 @@ def _robot():
         _robot_obj = _ydfpy.URDF.load(str(URDF_PATH))
     return _robot_obj
 
-def fk(q7: np.ndarray) -> np.ndarray:
-    """(7,) in retarget order → (8,3) link positions."""
+# Official link names in unitree_dex3_right.urdf
+LINKS = [
+    "right_hand_palm_link",
+    "right_hand_thumb_0_link","right_hand_thumb_1_link","right_hand_thumb_2_link",
+    "right_hand_index_0_link","right_hand_index_1_link",
+    "right_hand_middle_0_link","right_hand_middle_1_link",
+]
+BONES = [(0,1),(1,2),(2,3),(0,4),(4,5),(0,6),(6,7),(4,6)]
+
+def fk(q7_hw: np.ndarray) -> np.ndarray:
+    """(7,) hardware order → (8,3) link positions."""
     rob = _robot()
-    q_urdf = q7[REORDER_TO_URDF]
-    rob.update_cfg({n: float(v) for n,v in zip(rob.actuated_joint_names, q_urdf)})
+    rob.update_cfg({n: float(v) for n,v in zip(DEX3_HW_JOINTS, q7_hw)})
     return np.array([rob.get_transform(l)[:3,3] for l in LINKS], dtype=np.float32)
 
-def fk_batch(q_seq: np.ndarray) -> np.ndarray:
-    return np.stack([fk(q_seq[t]) for t in range(len(q_seq))])
+def fk_batch(q_seq): return np.stack([fk(q_seq[t]) for t in range(len(q_seq))])
 
-# joint limits for bar chart — retarget_dex3 order
-_LO_DEG = np.degrees(_LO)
-_HI_DEG = np.degrees(_HI)
+# Joint display names (hardware order)
+JOINT_NAMES_DISP = ["thumb_0","thumb_1","thumb_2","middle_0","middle_1","index_0","index_1"]
+
+# Joint limits in hardware order
+_LO_DEG = np.array([-60,-60,-100,  0,  0,  0,  0], np.float32)
+_HI_DEG = np.array([ 60, 35,   0, 90,100, 90,100], np.float32)
 DEX3_LIM = dict(x=(-0.02,0.15),y=(-0.12,0.12),z=(-0.06,0.06))
+
+# ─── Colours ─────────────────────────────────────────────────────────────────
+BG      = "#0d1117"
+ROB_COL = "#a29bfe"
+FCOL    = {"thumb":"#FF6B6B","index":"#4ECDC4","middle":"#FFD93D"}
 
 # ─── EgoDex joints ───────────────────────────────────────────────────────────
 RIGHT_JOINTS = [
@@ -149,11 +178,11 @@ def draw_dex3(ax, pts, color=ROB_COL, alpha=0.92):
 def _jbar(ax, q_deg, color=ROB_COL):
     ax.set_facecolor(BG)
     r=_HI_DEG-_LO_DEG; pct=(q_deg-_LO_DEG)/np.where(r>1e-4,r,1.)
-    cols=[FCOL["thumb"]]*3+[FCOL["index"]]*2+[FCOL["middle"]]*2
+    cols=[FCOL["thumb"]]*3+[FCOL["middle"]]*2+[FCOL["index"]]*2
     ax.barh(range(7),pct,color=cols,edgecolor="none",height=0.65,alpha=0.85)
     ax.barh(range(7),[1]*7,color="none",edgecolor="#444",height=0.65,lw=0.5)
     ax.set_yticks(range(7))
-    ax.set_yticklabels([f"{n} {v:+.0f}°" for n,v in zip(JOINT_NAMES,q_deg)],
+    ax.set_yticklabels([f"{n} {v:+.0f}°" for n,v in zip(JOINT_NAMES_DISP,q_deg)],
                         fontsize=5.5,color="white")
     ax.set_xlim(0,1.1); ax.set_xticks([0,1])
     ax.set_xticklabels(["lo","hi"],fontsize=5,color="white")
@@ -177,7 +206,7 @@ def plot_static(ep, q_seq, fk_seq, frame, out_path):
     ax_r = fig.add_subplot(gs[0,1],projection="3d")
     _sax(ax_r, robot=True)
     draw_dex3(ax_r, fk_seq[frame])
-    ax_r.set_title("Dex3-1 retargeted (angle-based geometric)", color=ROB_COL, fontsize=9, pad=5)
+    ax_r.set_title("Dex3-1 retargeted (DexPilot · official xr_teleoperate)", color=ROB_COL, fontsize=9, pad=5)
 
     ax_info = fig.add_subplot(gs[1,0]); ax_info.axis("off")
     ax_info.text(0.5, 0.5,
@@ -217,7 +246,7 @@ def make_animation(ep, q_seq, fk_seq, out_path, fps=30, stride=1):
 
         ax_r.cla(); _sax(ax_r,robot=True)
         draw_dex3(ax_r,fk_seq[t])
-        ax_r.set_title("Dex3-1 (geometric retarget)",color=ROB_COL,fontsize=8,pad=4)
+        ax_r.set_title("Dex3-1 (DexPilot official)",color=ROB_COL,fontsize=8,pad=4)
 
         ax_j.cla(); _jbar(ax_j,np.degrees(q_seq[t]))
         ax_j.set_title("Joint angles",color=ROB_COL,fontsize=7,pad=2)
@@ -234,24 +263,23 @@ def make_animation(ep, q_seq, fk_seq, out_path, fps=30, stride=1):
     print(f"  → {out_path}")
 
 # ─── Run one episode ─────────────────────────────────────────────────────────
-def run_one(hdf5_path, out_dir, args):
-    ep = load_ep(hdf5_path)
+def run_one(hdf5_path, out_dir, rt, indices, hw_order, args):
+    ep   = load_ep(hdf5_path)
     task = ep["task"].replace(" ","_").replace("/","_"); epn = ep["ep"]
     print(f"\n{'─'*55}\n{ep['task']}  T={ep['T']}  conf={ep['conf'].mean():.3f}")
     print(f"  {ep['desc'][:70]}")
 
-    t0 = time.perf_counter()
-    q_seq = retarget_dex3(ep["kp"], algo="angle", smoothing=0.3)
-    print(f"  Retargeting (angle-based): {(time.perf_counter()-t0)*1000:.1f}ms")
+    t0    = time.perf_counter()
+    q_seq = retarget_sequence(ep["kp_local"], rt, indices, hw_order)
+    print(f"  Retargeting (DexPilot official): {(time.perf_counter()-t0)*1000:.1f}ms")
     print(f"  q range: [{np.degrees(q_seq.min()):+.1f}°, {np.degrees(q_seq.max()):+.1f}°]")
-    # Confirm motion
     q_var = np.degrees(q_seq.std(axis=0))
-    movers = [(JOINT_NAMES[j], q_var[j]) for j in range(N_JOINTS) if q_var[j] > 1.0]
-    print(f"  Moving joints (std > 1°): {[(n, f'{v:.1f}°') for n,v in movers]}")
+    movers = [(JOINT_NAMES_DISP[j], q_var[j]) for j in range(7) if q_var[j] > 1.0]
+    print(f"  Moving joints (std>1°): {[(n, f'{v:.1f}°') for n,v in movers]}")
 
-    t0 = time.perf_counter()
+    t0     = time.perf_counter()
     fk_seq = fk_batch(q_seq)
-    print(f"  FK (yourdfpy): {(time.perf_counter()-t0)*1000:.1f}ms")
+    print(f"  FK (yourdfpy official URDF): {(time.perf_counter()-t0)*1000:.1f}ms")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     fr = args.frame if args.frame is not None else ep["T"]//2
@@ -282,8 +310,11 @@ def main():
         files = [REPO_ROOT/"samples/egodex/lock_unlock_key/9.hdf5"]
 
     print(f"Processing {len(files)} episodes → {args.out_dir}/")
+    print("Building official DexPilot retargeter …")
+    rt, indices, hw_order = build_retargeter()
+    print(f"  joint_names: {rt.joint_names}")
     for f in files:
-        run_one(f, args.out_dir, args)
+        run_one(f, args.out_dir, rt, indices, hw_order, args)
     print("\nDone.")
 
 if __name__ == "__main__":
